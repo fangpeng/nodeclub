@@ -6,109 +6,145 @@
  * Module dependencies.
  */
 
-var fs = require('fs');
+var config = require('./config');
+
+if (!config.debug) {
+  require('newrelic');
+}
+
 var path = require('path');
 var Loader = require('loader');
 var express = require('express');
-var ndir = require('ndir');
-var pkg = JSON.parse(fs.readFileSync(path.join(__dirname, 'package.json')));
-var config = require('./config').config;
-config.version = pkg.version;
+var session = require('express-session');
+var passport = require('passport');
+require('./models');
+var GitHubStrategy = require('passport-github').Strategy;
+var githubStrategyMiddleware = require('./middlewares/github_strategy');
+var webRouter = require('./web_router');
+var apiRouterV1 = require('./api_router_v1');
+var auth = require('./middlewares/auth');
+var MongoStore = require('connect-mongo')(session);
+var _ = require('lodash');
+var csurf = require('csurf');
+var compress = require('compression');
+var bodyParser = require('body-parser');
+var busboy = require('connect-busboy');
+var errorhandler = require('errorhandler');
+var cors = require('cors');
+
+// 静态文件目录
+var staticDir = path.join(__dirname, 'public');
 
 // assets
 var assets = {};
 if (config.mini_assets) {
   try {
-    assets = JSON.parse(fs.readFileSync(path.join(__dirname, 'assets.json')));
+    assets = require('./assets.json');
   } catch (e) {
     console.log('You must execute `make build` before start app when mini_assets is true.');
     throw e;
   }
 }
 
-// host: http://127.0.0.1
 var urlinfo = require('url').parse(config.host);
 config.hostname = urlinfo.hostname || config.host;
-var routes = require('./routes');
 
-config.upload_dir = config.upload_dir || path.join(__dirname, 'public', 'user_data', 'images');
-// ensure upload dir exists
-ndir.mkdir(config.upload_dir, function (err) {
-  if (err) {
-    throw err;
-  }
-});
-
-var app = express.createServer();
+var app = express();
 
 // configuration in all env
-app.configure(function () {
-  app.set('view engine', 'html');
-  app.set('views', path.join(__dirname, 'views'));
-  app.register('.html', require('ejs'));
-  app.use(express.bodyParser({
-    uploadDir: config.upload_dir
-  }));
-  app.use(express.cookieParser());
-  app.use(express.session({
-    secret: config.session_secret
-  }));
-  // custom middleware
-  app.use(require('./controllers/sign').auth_user);
+app.set('views', path.join(__dirname, 'views'));
+app.set('view engine', 'html');
+app.engine('html', require('ejs-mate'));
+app.locals._layoutFile = 'layout.html';
 
-  var csrf = express.csrf();
+app.use(require('response-time')());
+app.use(bodyParser.json());
+app.use(bodyParser.urlencoded({
+  extended: true
+}));
+app.use(require('method-override')());
+app.use(require('cookie-parser')(config.session_secret));
+app.use(compress());
+app.use(session({
+  secret: config.session_secret,
+  store: new MongoStore({
+    url: config.db
+  }),
+  resave: true,
+  saveUninitialized: true,
+}));
+
+app.use(passport.initialize());
+
+// custom middleware
+app.use(auth.authUser);
+app.use(auth.blockUser());
+
+app.use(Loader.less(__dirname));
+app.use('/public', express.static(staticDir));
+
+if (!config.debug) {
   app.use(function (req, res, next) {
-    // ignore upload image
-    if (req.body && req.body.user_action === 'upload_image') {
-      return next();
+    if (req.path.indexOf('/api') === -1) {
+      csurf()(req, res, next);
+      return;
     }
-    csrf(req, res, next);
+    next();
   });
-});
-
-if (process.env.NODE_ENV !== 'test') {
-  // plugins
-  var plugins = config.plugins || [];
-  for (var i = 0, l = plugins.length; i < l; i++) {
-    var p = plugins[i];
-    app.use(require('./plugins/' + p.name)(p.options));
-  }
+  app.set('view cache', true);
 }
 
+// for debug
+// app.get('/err', function (req, res, next) {
+//   next(new Error('haha'))
+// });
+
 // set static, dynamic helpers
-app.helpers({
+_.extend(app.locals, {
   config: config,
   Loader: Loader,
   assets: assets
 });
-app.dynamicHelpers(require('./common/render_helpers'));
 
-var maxAge = 3600000 * 24 * 30;
-app.use('/upload/', express.static(config.upload_dir, { maxAge: maxAge }));
-// old image url: http://host/user_data/images/xxxx
-app.use('/user_data/', express.static(path.join(__dirname, 'public', 'user_data'), { maxAge: maxAge }));
-
-var staticDir = path.join(__dirname, 'public');
-app.configure('development', function () {
-  app.use('/public', express.static(staticDir));
-  app.use(express.errorHandler({ dumpExceptions: true, showStack: true }));
+_.extend(app.locals, require('./common/render_helper'));
+app.use(function (req, res, next) {
+  res.locals.csrf = req.csrfToken ? req.csrfToken() : '';
+  next();
 });
 
-app.configure('production', function () {
-  app.use('/public', express.static(staticDir, { maxAge: maxAge }));
-  app.use(express.errorHandler());
-  app.set('view cache', true);
+// github oauth
+passport.serializeUser(function (user, done) {
+  done(null, user);
 });
+passport.deserializeUser(function (user, done) {
+  done(null, user);
+});
+passport.use(new GitHubStrategy(config.GITHUB_OAUTH, githubStrategyMiddleware));
+
+app.use(busboy({
+  limits: {
+    fileSize: 10 * 1024 * 1024 // 10MB
+  }
+}));
 
 // routes
-routes(app);
+app.use('/', webRouter);
+app.use('/api/v1', cors(), apiRouterV1);
 
-if (process.env.NODE_ENV !== 'test') {
-  app.listen(config.port);
+// error handler
+if (config.debug) {
+  app.use(errorhandler());
+} else {
+  app.use(function (err, req, res, next) {
+    return res.status(500).send('500 status');
+  });
+}
 
+app.listen(config.port, function () {
   console.log("NodeClub listening on port %d in %s mode", config.port, app.settings.env);
   console.log("God bless love....");
   console.log("You can debug your app with http://" + config.hostname + ':' + config.port);
-}
+});
+
 
 module.exports = app;
